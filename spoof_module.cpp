@@ -1,105 +1,254 @@
+#include <zygisk.hpp>
 #include <jni.h>
+#include <android/log.h>
 #include <string>
-#include <android-base/properties.h>
-#include "zygisk.hpp"
+#include <fcntl.h>
+#include <unistd.h>
+#include <fstream>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <nlohmann/json.hpp>
 
-using zygisk::Api;
-using zygisk::AppSpecializeArgs;
+#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "SpoofModule", __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, "SpoofModule", __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "SpoofModule", __VA_ARGS__)
 
-class HideDevOptions : public zygisk::ModuleBase {
+using json = nlohmann::json;
+
+static const char* TARGET_PACKAGE = "com.tosan.dara.sepah";
+static const char* MODULE_ID = "spoofdevoptions";
+
+// Define settings and props arrays at file scope to ensure they are complete
+static const struct Setting {
+    const char* className;
+    const char* settingKey;
+    const char* preferenceKey;
+} settings[] = {
+    {"android.provider.Settings$Global", "development_settings_enabled", "development_settings_enabled"},
+    {"android.provider.Settings$Secure", "development_settings_enabled", "development_settings_enabled_legacy"},
+    {"android.provider.Settings$Global", "adb_enabled", "adb_enabled"},
+    {"android.provider.Settings$Secure", "adb_enabled", "adb_enabled_legacy"},
+    {"android.provider.Settings$Global", "adb_wifi_enabled", "adb_wifi_enabled"},
+};
+
+static const struct Property {
+    const char* propertyKey;
+    const char* preferenceKey;
+    const char* overrideValue;
+    bool customOverride;
+} props[] = {
+    {"sys.usb.state", "adb_system_props_usb_state", "mtp", false},
+    {"sys.usb.config", "adb_system_props_usb_config", "mtp", false},
+    {"persist.sys.usb.reboot.func", "adb_system_props_reboot_func", "mtp", false},
+    {"init.svc.adbd", "adb_system_props_svc_adbd", "stopped", false},
+    {"sys.usb.ffs.ready", "adb_system_props_ffs_ready", "0", true},
+};
+
+class SpoofModule : public zygisk::ModuleBase {
 public:
-    void onLoad(Api *api, JNIEnv *env) override {
+    void onLoad(zygisk::Api* api, JNIEnv* env) override {
         this->api = api;
         this->env = env;
+        LOGD("Module loaded successfully");
     }
 
-    void preAppSpecialize(AppSpecializeArgs *args) override {
-        // فقط برای پکیج مورد نظر ما فعال شود
-        if (args->nice_name && env->GetStringUTFChars(args->nice_name, nullptr) {
-            std::string package_name = env->GetStringUTFChars(args->nice_name, nullptr);
-            if (package_name == "com.tosan.dara.sepah") {
-                target_package = true;
-            }
+    void preAppSpecialize(zygisk::AppSpecializeArgs* args) override {
+        if (!args || !args->nice_name) {
+            LOGW("No nice_name in args");
+            api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+            return;
         }
-    }
 
-    void postAppSpecialize(const AppSpecializeArgs *args) override {
-        if (!target_package) return;
+        jstring package_name = args->nice_name;
+        const char* package_cstr = env->GetStringUTFChars(package_name, nullptr);
+        if (!package_cstr) {
+            LOGE("Failed to get package name");
+            api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+            return;
+        }
 
-        // Hook توابع مربوط به تنظیمات توسعه‌دهنده
-        hookSettings();
+        std::string package(package_cstr);
+        env->ReleaseStringUTFChars(package_name, package_cstr);
+
+        if (package != TARGET_PACKAGE) {
+            LOGD("Package %s is not target, closing module", package.c_str());
+            api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+            return;
+        }
+
+        LOGD("Processing package: %s", TARGET_PACKAGE);
+
+        // Load configuration
+        json config = loadConfig();
+        if (config.is_discarded()) {
+            LOGE("Failed to load config, closing module");
+            api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+            return;
+        }
+
+        // Hook Settings.Global, Settings.Secure, and SystemProperties
+        hookSettingsMethods(config);
+        hookSystemProperties(config);
     }
 
 private:
-    bool target_package = false;
-    Api *api;
-    JNIEnv *env;
+    zygisk::Api* api;
+    JNIEnv* env;
 
-    void hookSettings() {
-        // Hook کردن SystemProperties.get
-        auto system_properties_class = env->FindClass("android/os/SystemProperties");
-        if (system_properties_class) {
+    json loadConfig() {
+        int module_fd = api->getModuleDir();
+        if (module_fd < 0) {
+            LOGE("Failed to get module directory: %d", module_fd);
+            return json();
+        }
+
+        std::string config_path = "/proc/self/fd/" + std::to_string(module_fd) + "/config.json";
+        LOGD("Attempting to load config from: %s", config_path.c_str());
+
+        if (access(config_path.c_str(), R_OK) != 0) {
+            LOGE("Cannot access config.json at %s: %s", config_path.c_str(), strerror(errno));
+            return json();
+        }
+
+        std::ifstream config_file(config_path);
+        if (!config_file.is_open()) {
+            LOGE("Failed to open config.json at %s", config_path.c_str());
+            return json();
+        }
+
+        json config;
+        try {
+            config = json::parse(config_file, nullptr, false);
+            LOGD("Config loaded successfully");
+        } catch (const json::exception& e) {
+            LOGE("JSON parsing error: %s", e.what());
+            config = json();
+        }
+        config_file.close();
+        return config;
+    }
+
+    static jstring getStringForUserHook(JNIEnv* env, jobject, jstring key, jint) {
+        const char* key_cstr = env->GetStringUTFChars(key, nullptr);
+        if (!key_cstr) return nullptr;
+
+        std::string key_str(key_cstr);
+        env->ReleaseStringUTFChars(key, key_cstr);
+
+        for (size_t i = 0; i < sizeof(settings) / sizeof(settings[0]); ++i) {
+            if (key_str == settings[i].settingKey) {
+                LOGD("Hooked getStringForUser for %s", settings[i].settingKey);
+                return env->NewStringUTF("0");
+            }
+        }
+        return nullptr;
+    }
+
+    void hookSettingsMethods(const json& config) {
+        for (size_t i = 0; i < sizeof(settings) / sizeof(settings[0]); ++i) {
+            if (!config.value(settings[i].preferenceKey, true)) {
+                LOGD("Skipping hook for %s (disabled in config)", settings[i].preferenceKey);
+                continue;
+            }
+
             JNINativeMethod methods[] = {
-                {"get", "(Ljava/lang/String;)Ljava/lang/String;", (void*) hookedGet},
-                {"get", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;", (void*) hookedGetWithDefault},
-                {"getBoolean", "(Ljava/lang/String;Z)Z", (void*) hookedGetBoolean}
+                {"getStringForUser", "(Ljava/lang/String;I)Ljava/lang/String;", (void*)getStringForUserHook}
             };
-            api->hookJniNativeMethods(env, "android/os/SystemProperties", methods, 3);
+            api->hookJniNativeMethods(env, settings[i].className, methods, 1);
+            LOGD("Hooked %s.getStringForUser", settings[i].className);
         }
+    }
 
-        // Hook کردن Settings.Global.getInt
-        auto settings_global_class = env->FindClass("android/provider/Settings$Global");
-        if (settings_global_class) {
+    static jstring getPropHook(JNIEnv* env, jclass, jstring key) {
+        const char* key_cstr = env->GetStringUTFChars(key, nullptr);
+        if (!key_cstr) return nullptr;
+
+        std::string key_str(key_cstr);
+        env->ReleaseStringUTFChars(key, key_cstr);
+
+        for (size_t i = 0; i < sizeof(props) / sizeof(props[0]); ++i) {
+            if (key_str == props[i].propertyKey) {
+                LOGD("Hooked SystemProperties.get for %s", props[i].propertyKey);
+                return env->NewStringUTF(props[i].overrideValue);
+            }
+        }
+        return nullptr;
+    }
+
+    static jboolean getBooleanPropHook(JNIEnv* env, jclass, jstring key, jboolean def) {
+        const char* key_cstr = env->GetStringUTFChars(key, nullptr);
+        if (!key_cstr) return def;
+
+        std::string key_str(key_cstr);
+        env->ReleaseStringUTFChars(key, key_cstr);
+
+        for (size_t i = 0; i < sizeof(props) / sizeof(props[0]); ++i) {
+            if (key_str == props[i].propertyKey) {
+                LOGD("Hooked SystemProperties.getBoolean for %s", props[i].propertyKey);
+                return props[i].customOverride && props[i].propertyKey == std::string("sys.usb.ffs.ready") ? JNI_FALSE : (props[i].overrideValue == std::string("true") ? JNI_TRUE : JNI_FALSE);
+            }
+        }
+        return def;
+    }
+
+    static jint getIntPropHook(JNIEnv* env, jclass, jstring key, jint def) {
+        const char* key_cstr = env->GetStringUTFChars(key, nullptr);
+        if (!key_cstr) return def;
+
+        std::string key_str(key_cstr);
+        env->ReleaseStringUTFChars(key, key_cstr);
+
+        for (size_t i = 0; i < sizeof(props) / sizeof(props[0]); ++i) {
+            if (key_str == props[i].propertyKey) {
+                LOGD("Hooked SystemProperties.getInt for %s", props[i].propertyKey);
+                try {
+                    return props[i].customOverride && props[i].propertyKey == std::string("sys.usb.ffs.ready") ? 0 : std::stoi(props[i].overrideValue);
+                } catch (...) {
+                    return 0;
+                }
+            }
+        }
+        return def;
+    }
+
+    static jlong getLongPropHook(JNIEnv* env, jclass, jstring key, jlong def) {
+        const char* key_cstr = env->GetStringUTFChars(key, nullptr);
+        if (!key_cstr) return def;
+
+        std::string key_str(key_cstr);
+        env->ReleaseStringUTFChars(key, key_cstr);
+
+        for (size_t i = 0; i < sizeof(props) / sizeof(props[0]); ++i) {
+            if (key_str == props[i].propertyKey) {
+                LOGD("Hooked SystemProperties.getLong for %s", props[i].propertyKey);
+                try {
+                    return props[i].customOverride && props[i].propertyKey == std::string("sys.usb.ffs.ready") ? 0L : std::stol(props[i].overrideValue);
+                } catch (...) {
+                    return 0L;
+                }
+            }
+        }
+        return def;
+    }
+
+    void hookSystemProperties(const json& config) {
+        for (size_t i = 0; i < sizeof(props) / sizeof(props[0]); ++i) {
+            if (!config.value(props[i].preferenceKey, true)) {
+                LOGD("Skipping hook for %s (disabled in config)", props[i].preferenceKey);
+                continue;
+            }
+
             JNINativeMethod methods[] = {
-                {"getInt", "(Landroid/content/ContentResolver;Ljava/lang/String;I)I", (void*) hookedGetInt},
-                {"getInt", "(Landroid/content/ContentResolver;Ljava/lang/String;)I", (void*) hookedGetIntNoDefault}
+                {"get", "(Ljava/lang/String;)Ljava/lang/String;", (void*)getPropHook},
+                {"get", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;", (void*)getPropHook},
+                {"getBoolean", "(Ljava/lang/String;Z)Z", (void*)getBooleanPropHook},
+                {"getInt", "(Ljava/lang/String;I)I", (void*)getIntPropHook},
+                {"getLong", "(Ljava/lang/String;J)J", (void*)getLongPropHook},
             };
-            api->hookJniNativeMethods(env, "android/provider/Settings$Global", methods, 2);
+            api->hookJniNativeMethods(env, "android.os.SystemProperties", methods, 5);
+            LOGD("Hooked SystemProperties for %s", props[i].propertyKey);
         }
-    }
-
-    // توابع hook شده
-    static jstring hookedGet(JNIEnv *env, jobject, jstring key) {
-        const char* key_str = env->GetStringUTFChars(key, nullptr);
-        if (strcmp(key_str, "sys.usb.config") == 0 || 
-            strcmp(key_str, "sys.usb.state") == 0 ||
-            strcmp(key_str, "init.svc.adbd") == 0) {
-            return env->NewStringUTF("mtp");
-        }
-        return env->NewStringUTF(android::base::GetProperty(key_str, "").c_str());
-    }
-
-    static jstring hookedGetWithDefault(JNIEnv *env, jobject, jstring key, jstring def) {
-        const char* key_str = env->GetStringUTFChars(key, nullptr);
-        if (strcmp(key_str, "sys.usb.config") == 0 || 
-            strcmp(key_str, "sys.usb.state") == 0 ||
-            strcmp(key_str, "init.svc.adbd") == 0) {
-            return env->NewStringUTF("mtp");
-        }
-        return def;
-    }
-
-    static jboolean hookedGetBoolean(JNIEnv *env, jobject, jstring key, jboolean def) {
-        const char* key_str = env->GetStringUTFChars(key, nullptr);
-        if (strcmp(key_str, "persist.sys.usb.config") == 0) {
-            return false;
-        }
-        return def;
-    }
-
-    static jint hookedGetInt(JNIEnv *env, jobject, jobject resolver, jstring key, jint def) {
-        const char* key_str = env->GetStringUTFChars(key, nullptr);
-        if (strcmp(key_str, "adb_enabled") == 0 || 
-            strcmp(key_str, "development_settings_enabled") == 0 ||
-            strcmp(key_str, "adb_wifi_enabled") == 0) {
-            return 0;
-        }
-        return def;
-    }
-
-    static jint hookedGetIntNoDefault(JNIEnv *env, jobject, jobject resolver, jstring key) {
-        return hookedGetInt(env, nullptr, resolver, key, 0);
     }
 };
 
-REGISTER_ZYGISK_MODULE(HideDevOptions)
+REGISTER_ZYGISK_MODULE(SpoofModule)
