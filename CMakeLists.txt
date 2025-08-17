@@ -4,11 +4,7 @@ project(SpoofModule)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Include NDK sysroot and architecture-specific headers
-include_directories($ENV{NDK_PATH}/sysroot/usr/include)
-include_directories($ENV{NDK_PATH}/sysroot/usr/include/${ANDROID_ABI})
-
-add_library(spoof SHARED spoof_module.cpp)
+add_library(spoof SHARED src/spoof_module.cpp)
 
 find_library(log-lib log)
 
