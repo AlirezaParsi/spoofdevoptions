@@ -1,4 +1,4 @@
-name: SpoofDevOptions
+name: Build SpoofDevOptions
 
 on:
   workflow_dispatch:
@@ -68,8 +68,8 @@ jobs:
             exit 1
           fi
           echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> $GITHUB_PATH
-          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "ndk;25.2.9519653" "platforms;android-34" "build-tools;34.0.0"
-          echo "NDK_PATH=$ANDROID_HOME/ndk/25.2.9519653" >> $GITHUB_ENV
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "ndk;23.2.8568313" "platforms;android-34" "build-tools;34.0.0"
+          echo "NDK_PATH=$ANDROID_HOME/ndk/23.2.8568313" >> $GITHUB_ENV
 
       - name: Accept Android SDK licenses
         run: |
@@ -85,6 +85,8 @@ jobs:
         run: |
           mkdir -p zygisk include/nlohmann
           wget https://raw.githubusercontent.com/topjohnwu/zygisk-module-sample/master/module/jni/zygisk.hpp -O zygisk/zygisk.hpp
+          # Patch zygisk.hpp to include sys/types.h and sys/stat.h
+          sed -i '1i #include <sys/types.h>\n#include <sys/stat.h>' zygisk/zygisk.hpp
           wget https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp -O include/nlohmann/json.hpp
 
       - name: Build Project (arm64-v8a) - Start
@@ -103,6 +105,7 @@ jobs:
             -DANDROID_STL=c++_shared
             -DCMAKE_MAKE_PROGRAM=/usr/bin/make
             -DCMAKE_SYSROOT=${{ env.NDK_PATH }}/sysroot
+            -DCMAKE_VERBOSE_MAKEFILE=ON
 
       - name: Build Project (arm64-v8a) - End
         id: arm64_end
@@ -132,6 +135,7 @@ jobs:
             -DANDROID_STL=c++_shared
             -DCMAKE_MAKE_PROGRAM=/usr/bin/make
             -DCMAKE_SYSROOT=${{ env.NDK_PATH }}/sysroot
+            -CMAKE_VERBOSE_MAKEFILE=ON
 
       - name: Build Project (armeabi-v7a) - End
         id: arm32_end
