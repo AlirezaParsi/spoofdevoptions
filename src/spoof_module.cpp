@@ -6,38 +6,67 @@
 #define LOG_TAG "SpoofModule"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 
-static jstring (*orig_SystemProperties_get)(JNIEnv*, jclass, jstring, jstring);
-static jint (*orig_Settings_getInt)(JNIEnv*, jclass, jobject, jstring, jint);
+// ---- SystemProperties ----
+static jstring (*orig_SP_get1)(JNIEnv*, jclass, jstring); // get(key)
+static jstring (*orig_SP_get2)(JNIEnv*, jclass, jstring, jstring); // get(key, def)
+static jboolean (*orig_SP_getBoolean)(JNIEnv*, jclass, jstring, jboolean);
+static jint (*orig_SP_getInt)(JNIEnv*, jclass, jstring, jint);
+static jlong (*orig_SP_getLong)(JNIEnv*, jclass, jstring, jlong);
 
-static jstring spoof_SystemProperties_get(JNIEnv* env, jclass clazz, jstring key, jstring def) {
+static jstring hook_SP_get1(JNIEnv* env, jclass clazz, jstring key) {
     const char* keyStr = env->GetStringUTFChars(key, nullptr);
-    std::string keyCpp(keyStr);
+    LOGD("SystemProperties.get(String) called with key=%s", keyStr);
     env->ReleaseStringUTFChars(key, keyStr);
-
-    if (keyCpp == "sys.usb.state" ||
-        keyCpp == "sys.usb.config" ||
-        keyCpp == "persist.sys.usb.reboot.func" ||
-        keyCpp == "init.svc.adbd" ||
-        keyCpp == "sys.usb.ffs.ready") {
-        return env->NewStringUTF("0"); // یا "mtp"
-    }
-    return orig_SystemProperties_get(env, clazz, key, def);
+    return orig_SP_get1(env, clazz, key);
 }
 
-static jint spoof_Settings_getInt(JNIEnv* env, jclass clazz, jobject cr, jstring name, jint def) {
+static jstring hook_SP_get2(JNIEnv* env, jclass clazz, jstring key, jstring def) {
+    const char* keyStr = env->GetStringUTFChars(key, nullptr);
+    LOGD("SystemProperties.get(String,String) called with key=%s", keyStr);
+    env->ReleaseStringUTFChars(key, keyStr);
+    return orig_SP_get2(env, clazz, key, def);
+}
+
+static jboolean hook_SP_getBoolean(JNIEnv* env, jclass clazz, jstring key, jboolean def) {
+    const char* keyStr = env->GetStringUTFChars(key, nullptr);
+    LOGD("SystemProperties.getBoolean called with key=%s", keyStr);
+    env->ReleaseStringUTFChars(key, keyStr);
+    return orig_SP_getBoolean(env, clazz, key, def);
+}
+
+static jint hook_SP_getInt(JNIEnv* env, jclass clazz, jstring key, jint def) {
+    const char* keyStr = env->GetStringUTFChars(key, nullptr);
+    LOGD("SystemProperties.getInt called with key=%s", keyStr);
+    env->ReleaseStringUTFChars(key, keyStr);
+    return orig_SP_getInt(env, clazz, key, def);
+}
+
+static jlong hook_SP_getLong(JNIEnv* env, jclass clazz, jstring key, jlong def) {
+    const char* keyStr = env->GetStringUTFChars(key, nullptr);
+    LOGD("SystemProperties.getLong called with key=%s", keyStr);
+    env->ReleaseStringUTFChars(key, keyStr);
+    return orig_SP_getLong(env, clazz, key, def);
+}
+
+// ---- Settings ----
+static jint (*orig_Settings_getInt1)(JNIEnv*, jclass, jobject, jstring);
+static jint (*orig_Settings_getInt2)(JNIEnv*, jclass, jobject, jstring, jint);
+
+static jint hook_Settings_getInt1(JNIEnv* env, jclass clazz, jobject cr, jstring name) {
     const char* keyStr = env->GetStringUTFChars(name, nullptr);
-    std::string keyCpp(keyStr);
+    LOGD("Settings.getInt(cr, key) called with key=%s", keyStr);
     env->ReleaseStringUTFChars(name, keyStr);
-
-    if (keyCpp == "development_settings_enabled" ||
-        keyCpp == "adb_enabled" ||
-        keyCpp == "adb_wifi_enabled") {
-        return 0; // همیشه خاموش
-    }
-    return orig_Settings_getInt(env, clazz, cr, name, def);
+    return orig_Settings_getInt1(env, clazz, cr, name);
 }
 
-class SpoofModule : public zygisk::ModuleBase {
+static jint hook_Settings_getInt2(JNIEnv* env, jclass clazz, jobject cr, jstring name, jint def) {
+    const char* keyStr = env->GetStringUTFChars(name, nullptr);
+    LOGD("Settings.getInt(cr, key, def) called with key=%s", keyStr);
+    env->ReleaseStringUTFChars(name, keyStr);
+    return orig_Settings_getInt2(env, clazz, cr, name, def);
+}
+
+class LoggerModule : public zygisk::ModuleBase {
 public:
     void onLoad(zygisk::Api* api, JNIEnv* env) override {
         this->api = api;
@@ -46,28 +75,51 @@ public:
 
     void preAppSpecialize(zygisk::AppSpecializeArgs* args) override {
         const char* pkg = args->nice_name ? env->GetStringUTFChars(args->nice_name, nullptr) : "";
-        if (pkg && std::string(pkg) == "com.tosan.dara.sepah") {
-            LOGD("Target app detected: %s", pkg);
+        LOGD("App detected: %s", pkg);
 
-            JNINativeMethod methods1[] = {
-                {"get", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;", (void*) spoof_SystemProperties_get},
+        // --- hook SystemProperties ---
+        {
+            JNINativeMethod m[] = {
+                {"get", "(Ljava/lang/String;)Ljava/lang/String;", (void*) hook_SP_get1},
+                {"get", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;", (void*) hook_SP_get2},
+                {"getBoolean", "(Ljava/lang/String;Z)Z", (void*) hook_SP_getBoolean},
+                {"getInt", "(Ljava/lang/String;I)I", (void*) hook_SP_getInt},
+                {"getLong", "(Ljava/lang/String;J)J", (void*) hook_SP_getLong},
             };
-            api->hookJniNativeMethods(env, "android/os/SystemProperties", methods1, 1);
-            *(void**)&orig_SystemProperties_get = methods1[0].fnPtr;
-
-            JNINativeMethod methods2[] = {
-                {"getInt", "(Landroid/content/ContentResolver;Ljava/lang/String;I)I", (void*) spoof_Settings_getInt},
-            };
-            api->hookJniNativeMethods(env, "android/provider/Settings$Global", methods2, 1);
-            *(void**)&orig_Settings_getInt = methods2[0].fnPtr;
-
-            api->hookJniNativeMethods(env, "android/provider/Settings$Secure", methods2, 1);
+            api->hookJniNativeMethods(env, "android/os/SystemProperties", m, sizeof(m)/sizeof(m[0]));
+            orig_SP_get1 = (decltype(orig_SP_get1)) m[0].fnPtr;
+            orig_SP_get2 = (decltype(orig_SP_get2)) m[1].fnPtr;
+            orig_SP_getBoolean = (decltype(orig_SP_getBoolean)) m[2].fnPtr;
+            orig_SP_getInt = (decltype(orig_SP_getInt)) m[3].fnPtr;
+            orig_SP_getLong = (decltype(orig_SP_getLong)) m[4].fnPtr;
         }
+
+        // --- hook Settings.Global ---
+        {
+            JNINativeMethod m[] = {
+                {"getInt", "(Landroid/content/ContentResolver;Ljava/lang/String;)I", (void*) hook_Settings_getInt1},
+                {"getInt", "(Landroid/content/ContentResolver;Ljava/lang/String;I)I", (void*) hook_Settings_getInt2},
+            };
+            api->hookJniNativeMethods(env, "android/provider/Settings$Global", m, 2);
+            orig_Settings_getInt1 = (decltype(orig_Settings_getInt1)) m[0].fnPtr;
+            orig_Settings_getInt2 = (decltype(orig_Settings_getInt2)) m[1].fnPtr;
+        }
+
+        // --- hook Settings.Secure ---
+        {
+            JNINativeMethod m[] = {
+                {"getInt", "(Landroid/content/ContentResolver;Ljava/lang/String;)I", (void*) hook_Settings_getInt1},
+                {"getInt", "(Landroid/content/ContentResolver;Ljava/lang/String;I)I", (void*) hook_Settings_getInt2},
+            };
+            api->hookJniNativeMethods(env, "android/provider/Settings$Secure", m, 2);
+        }
+
+        if (pkg) env->ReleaseStringUTFChars(args->nice_name, pkg);
     }
 
 private:
-    zygisk::Api* api;
-    JNIEnv* env;
+    zygisk::Api* api{};
+    JNIEnv* env{};
 };
 
-REGISTER_ZYGISK_MODULE(SpoofModule)
+REGISTER_ZYGISK_MODULE(LoggerModule)
