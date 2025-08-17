@@ -1,0 +1,12 @@
+{
+    "development_settings_enabled": true,
+    "development_settings_enabled_legacy": true,
+    "adb_enabled": true,
+    "adb_enabled_legacy": true,
+    "adb_wifi_enabled": true,
+    "adb_system_props_usb_state": true,
+    "adb_system_props_usb_config": true,
+    "adb_system_props_reboot_func": true,
+    "adb_system_props_svc_adbd": true,
+    "adb_system_props_ffs_ready": true
+}
