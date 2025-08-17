@@ -1,0 +1,7 @@
+id=spoofdevoptions
+name=Spoof Developer Options
+version=1.0.0
+versionCode=100
+author=AlirezaParsi
+description=Hides USB Debugging and Developer Options
+minMagisk=20.4
