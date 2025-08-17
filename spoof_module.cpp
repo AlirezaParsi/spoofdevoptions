@@ -11,6 +11,7 @@
 
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "spoofdevoptions", __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, "spoofdevoptions", __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "spoofdevoptions", __VA_ARGS__)
 
 using json = nlohmann::json;
 
@@ -22,18 +23,21 @@ public:
     void onLoad(zygisk::Api* api, JNIEnv* env) override {
         this->api = api;
         this->env = env;
+        LOGD("Module loaded successfully");
     }
 
     void preAppSpecialize(zygisk::AppSpecializeArgs* args) override {
         if (!args || !args->nice_name) {
             LOGW("No nice_name in args");
+            api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
             return;
         }
 
         jstring package_name = args->nice_name;
         const char* package_cstr = env->GetStringUTFChars(package_name, nullptr);
         if (!package_cstr) {
-            LOGW("Failed to get package name");
+            LOGE("Failed to get package name");
+            api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
             return;
         }
 
@@ -41,6 +45,7 @@ public:
         env->ReleaseStringUTFChars(package_name, package_cstr);
 
         if (package != TARGET_PACKAGE) {
+            LOGD("Package %s is not target, closing module", package.c_str());
             api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
             return;
         }
@@ -48,28 +53,14 @@ public:
         LOGD("Processing package: %s", TARGET_PACKAGE);
 
         // Load configuration
-        int module_fd = api->getModuleDir();
-        if (module_fd < 0) {
-            LOGW("Failed to get module directory");
+        json config = loadConfig();
+        if (config.is_discarded()) {
+            LOGE("Failed to load config, closing module");
+            api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
             return;
         }
 
-        std::string config_path = "/proc/self/fd/" + std::to_string(module_fd) + "/config.json";
-        std::ifstream config_file(config_path);
-        json config;
-        if (config_file.is_open()) {
-            config = json::parse(config_file, nullptr, false);
-            config_file.close();
-            if (config.is_discarded()) {
-                LOGW("Failed to parse config.json");
-                return;
-            }
-        } else {
-            LOGW("Failed to open config.json");
-            return;
-        }
-
-        // Hook Settings.Global and Settings.Secure
+        // Hook Settings.Global, Settings.Secure, and SystemProperties
         hookSettingsMethods(config);
         hookSystemProperties(config);
     }
@@ -94,6 +85,39 @@ private:
     static const Setting settings[];
     static const Property props[];
 
+    json loadConfig() {
+        int module_fd = api->getModuleDir();
+        if (module_fd < 0) {
+            LOGE("Failed to get module directory: %d", module_fd);
+            return json();
+        }
+
+        std::string config_path = "/proc/self/fd/" + std::to_string(module_fd) + "/config.json";
+        LOGD("Attempting to load config from: %s", config_path.c_str());
+
+        if (access(config_path.c_str(), R_OK) != 0) {
+            LOGE("Cannot access config.json at %s: %s", config_path.c_str(), strerror(errno));
+            return json();
+        }
+
+        std::ifstream config_file(config_path);
+        if (!config_file.is_open()) {
+            LOGE("Failed to open config.json at %s", config_path.c_str());
+            return json();
+        }
+
+        json config;
+        try {
+            config = json::parse(config_file, nullptr, false);
+            LOGD("Config loaded successfully");
+        } catch (const json::exception& e) {
+            LOGE("JSON parsing error: %s", e.what());
+            config = json();
+        }
+        config_file.close();
+        return config;
+    }
+
     static jstring getStringForUserHook(JNIEnv* env, jobject, jstring key, jint) {
         const char* key_cstr = env->GetStringUTFChars(key, nullptr);
         if (!key_cstr) return nullptr;
@@ -112,7 +136,10 @@ private:
 
     void hookSettingsMethods(const json& config) {
         for (const auto& setting : settings) {
-            if (!config.value(setting.preferenceKey, true)) continue;
+            if (!config.value(setting.preferenceKey, true)) {
+                LOGD("Skipping hook for %s (disabled in config)", setting.preferenceKey);
+                continue;
+            }
 
             JNINativeMethod methods[] = {
                 {"getStringForUser", "(Ljava/lang/String;I)Ljava/lang/String;", (void*)getStringForUserHook}
@@ -196,7 +223,10 @@ private:
 
     void hookSystemProperties(const json& config) {
         for (const auto& prop : props) {
-            if (!config.value(prop.preferenceKey, true)) continue;
+            if (!config.value(prop.preferenceKey, true)) {
+                LOGD("Skipping hook for %s (disabled in config)", prop.preferenceKey);
+                continue;
+            }
 
             JNINativeMethod methods[] = {
                 {"get", "(Ljava/lang/String;)Ljava/lang/String;", (void*)getPropHook},
@@ -211,6 +241,7 @@ private:
     }
 };
 
+// Define static members outside the class
 const SpoofModule::Setting SpoofModule::settings[] = {
     {"android.provider.Settings$Global", "development_settings_enabled", "development_settings_enabled"},
     {"android.provider.Settings$Secure", "development_settings_enabled", "development_settings_enabled_legacy"},
